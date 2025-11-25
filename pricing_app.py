@@ -9,18 +9,16 @@ st.set_page_config(page_title="Pricing Strategy Engine Pro", layout="wide")
 
 def clean_accounting_number(val):
     """
-    Robust cleaner that handles:
-    - Currency: $1,000.00 -> 1000.0
-    - Accounting Negatives: (500.00) -> -500.0
-    - Empty/Dash: '-' -> 0
+    Robust cleaner that returns NaN for empty values (critical for overrides),
+    but handles accounting formats like (500.00).
     """
     if pd.isna(val) or val == '':
-        return 0.0
+        return np.nan  # Changed from 0.0 to NaN so we don't accidentally override with 0
     
     val_str = str(val).strip()
     
     if val_str == '-' or val_str == 'Placeholder':
-        return 0.0
+        return np.nan
         
     # Check for accounting format (123.45) -> -123.45
     if val_str.startswith('(') and val_str.endswith(')'):
@@ -32,14 +30,13 @@ def clean_accounting_number(val):
     try:
         return float(val_str)
     except:
-        return 0.0
+        return np.nan
 
 def load_data(uploaded_file):
     """Loads and cleans the main Data.csv file."""
     try:
         df = pd.read_csv(uploaded_file)
         
-        # Map columns to standard names
         cols_map = {
             'Full Amount': 'Full_List_Price',            
             'Avg Laid-In': 'Base_Cost',                  
@@ -54,22 +51,20 @@ def load_data(uploaded_file):
             'Package': 'Package'
         }
         
-        # Rename columns that exist
         df = df.rename(columns=cols_map)
 
-        # Ensure critical columns exist, if not create them with 0
+        # Ensure critical columns exist
         expected_cols = ['Full_List_Price', 'Base_Cost', 'Avg_Price', 'Avg_Discount', 'Units']
         for col in expected_cols:
             if col not in df.columns:
                 df[col] = 0.0
 
-        # CLEAN DATA (Apply the new robust cleaner)
+        # CLEAN DATA
         for col in expected_cols:
             df[col] = df[col].apply(clean_accounting_number)
 
-        # --- MAJOR CHANGE: DO NOT DROP ROWS ---
-        # Instead of dropping rows with missing cost, we keep them so Units match.
-        # We fill NaNs with 0 if any slipped through.
+        # For DATA ONLY, we fill NaNs with 0 (since we don't want math errors)
+        # We do this AFTER cleaning so the cleaner can return NaN for overrides
         df = df.fillna(0)
         
         return df
@@ -78,7 +73,7 @@ def load_data(uploaded_file):
         return None
 
 def load_taxco(uploaded_file):
-    """Loads the TAXCO.csv to get the tax per package."""
+    """Loads the TAXCO.csv."""
     try:
         df = pd.read_csv(uploaded_file)
         
@@ -115,26 +110,25 @@ def apply_strategy(df, tax_df, global_settings, pkg_overrides, fam_overrides, su
     else:
         res['Tax'] = 0
 
-    # Real Cost 
     res['Current_Cost_Final'] = res['Base_Cost'] + res['Tax']
-    
-    # Real Current GP
     res['Current_Unit_GP'] = res['Full_List_Price'] - res['Current_Cost_Final']
     res['Current_Line_DGP'] = res['Current_Unit_GP'] * res['Units']
-    
-    # Metric: Discount Total
     res['Current_Discount_Total'] = (res['Avg_Price'] - res['Full_List_Price']) * res['Units']
 
-    # --- 2. SANITIZE INPUTS ---
-    # Apply robust cleaner to inputs too
+    # --- 2. SANITIZE OVERRIDES ---
+    # We apply the cleaner, which returns NaN for blanks. 
+    # We DO NOT fillna(0) here, because NaN means "Use Global Default"
     if not pkg_overrides.empty and 'Price Increase' in pkg_overrides.columns:
         pkg_overrides['Price Increase'] = pkg_overrides['Price Increase'].apply(clean_accounting_number)
+    
     if not supp_overrides.empty and 'Price Increase' in supp_overrides.columns:
         supp_overrides['Price Increase'] = supp_overrides['Price Increase'].apply(clean_accounting_number)
+    
     if not fam_overrides.empty:
         for col in ['Price Increase', 'Growth %', 'Pkg Split %', 'Keg Split %']:
             if col in fam_overrides.columns:
                 fam_overrides[col] = fam_overrides[col].apply(clean_accounting_number)
+    
     if prod_overrides is not None and not prod_overrides.empty:
         prod_overrides['Price Increase'] = prod_overrides['Price Increase'].apply(clean_accounting_number)
 
@@ -147,14 +141,22 @@ def apply_strategy(df, tax_df, global_settings, pkg_overrides, fam_overrides, su
 
     def apply_map(source_df, key_col, val_col, target_col, rule_name):
         if not source_df.empty:
-            # Only use valid overrides (non-zero or specifically set)
-            # For this logic, we assume if it exists in the table, apply it.
             if val_col in source_df.columns:
-                mapper = source_df.set_index(key_col)[val_col]
-                mask = res[target_col].isin(mapper.index)
-                # Map and fill existing
-                res.loc[mask, 'Inc_Applied'] = res.loc[mask, target_col].map(mapper).fillna(res.loc[mask, 'Inc_Applied'])
-                res.loc[mask, 'Source_Rule'] = rule_name
+                # IMPORTANT: Drop rows where the value is NaN (Blank)
+                # This prevents blanks from overriding globals with 0
+                valid_source = source_df.dropna(subset=[val_col])
+                
+                if not valid_source.empty:
+                    mapper = valid_source.set_index(key_col)[val_col]
+                    mask = res[target_col].isin(mapper.index)
+                    
+                    # Map and fill existing (only overwrite if valid)
+                    res.loc[mask, 'Inc_Applied'] = res.loc[mask, target_col].map(mapper).fillna(res.loc[mask, 'Inc_Applied'])
+                    
+                    # Only update source rule if we actually applied a map
+                    # (This logic is slightly simplified: if mapped value exists, it updates)
+                    mapped_vals = res.loc[mask, target_col].map(mapper)
+                    res.loc[mask & mapped_vals.notna(), 'Source_Rule'] = rule_name
 
     # Package
     apply_map(pkg_overrides, 'Package', 'Price Increase', 'Package', 'Package Rule')
@@ -163,17 +165,23 @@ def apply_strategy(df, tax_df, global_settings, pkg_overrides, fam_overrides, su
     if not fam_overrides.empty:
         # Map Price
         if 'Price Increase' in fam_overrides.columns:
-            mapper = fam_overrides.set_index('Supplier Family')['Price Increase']
-            mask = res['Family'].isin(mapper.index)
-            res.loc[mask, 'Inc_Applied'] = res.loc[mask, 'Family'].map(mapper).fillna(res.loc[mask, 'Inc_Applied'])
-            res.loc[mask, 'Source_Rule'] = 'Family Rule'
+            valid_fam = fam_overrides.dropna(subset=['Price Increase'])
+            if not valid_fam.empty:
+                mapper = valid_fam.set_index('Supplier Family')['Price Increase']
+                mask = res['Family'].isin(mapper.index)
+                
+                res.loc[mask, 'Inc_Applied'] = res.loc[mask, 'Family'].map(mapper).fillna(res.loc[mask, 'Inc_Applied'])
+                
+                mapped_vals = res.loc[mask, 'Family'].map(mapper)
+                res.loc[mask & mapped_vals.notna(), 'Source_Rule'] = 'Family Rule'
             
         # Map Others
         for col, target in [('Growth %', 'Growth_Applied'), ('Pkg Split %', 'Pkg_Split_Applied'), ('Keg Split %', 'Keg_Split_Applied')]:
             if col in fam_overrides.columns:
-                val_map = fam_overrides.set_index('Supplier Family')[col]
-                # Only update where valid
-                res.loc[mask, target] = res.loc[mask, 'Family'].map(val_map).fillna(res.loc[mask, target])
+                valid_fam_opt = fam_overrides.dropna(subset=[col])
+                if not valid_fam_opt.empty:
+                    val_map = valid_fam_opt.set_index('Supplier Family')[col]
+                    res.loc[res['Family'].isin(val_map.index), target] = res['Family'].map(val_map).fillna(res[target])
 
     # Supplier
     apply_map(supp_overrides, 'Supplier', 'Price Increase', 'Supplier', 'Supplier Rule')
@@ -247,10 +255,9 @@ if file_data:
         if tax_df is None:
             st.warning("Note: No Tax file uploaded. Costs exclude tax.")
             
-        # Check for ZERO cost items to warn user
         zero_cost_count = len(df[df['Base_Cost'] == 0])
         if zero_cost_count > 0:
-            st.warning(f"⚠️ Warning: {zero_cost_count} products have $0.00 Cost. Profit margins for these will be 100%. Check your Data source.")
+            st.warning(f"⚠️ Warning: {zero_cost_count} products have $0.00 Cost. Check your Data source.")
 
         # --- SCENARIO BUILDER ---
         st.subheader("🛠️ Scenario Builder")
@@ -279,14 +286,10 @@ if file_data:
             
         with t_prod:
             st.info("💡 Tip: Download the template below, open it in Excel, fill in your exceptions, and upload it back here.")
-            
-            # --- AUTO-GENERATE TEMPLATE ---
             sample_prods = df['Product'].head(5).tolist() if not df.empty else ["Example Product A"]
             template_df = pd.DataFrame({'Product': sample_prods, 'Price Increase': [0.50, 1.00, 5.00, 10.00, 2.00]})
             csv_template = template_df.to_csv(index=False).encode('utf-8')
-            
             st.download_button("📥 Download Template CSV", csv_template, "product_exceptions_template.csv", "text/csv")
-            
             st.markdown("---")
             prod_file = st.file_uploader("Upload Exceptions CSV", type=['csv'])
             prod_overrides = pd.read_csv(prod_file) if prod_file else None
@@ -316,7 +319,6 @@ if file_data:
             st.bar_chart(results['Source_Rule'].value_counts())
             
             with st.expander("🔎 View Detailed Data (Price Scenarios Format)", expanded=True):
-                # --- PREPARE EXPORT DATAFRAME ---
                 export_df = pd.DataFrame()
                 export_df['Supplier Family'] = results['Family']
                 export_df['Supplier'] = results['Supplier']
